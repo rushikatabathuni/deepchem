@@ -27,6 +27,273 @@ from deepchem.utils.pytorch_utils import get_activation, segment_sum, unsorted_s
 from torch.nn import init as initializers
 
 
+#Encoder used for ADCNet Model
+class Encoder(nn.Module):
+    def __init__(self, num_layers, d_model, num_heads, dff, input_vocab_size, maximum_position_encoding=200, rate=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.num_layers = num_layers
+
+        # Use MATEmbedding from layers.py
+        self.embedding = MATEmbedding(d_input=input_vocab_size, d_output=d_model)
+
+        # Use MATEncoderLayer from layers.py
+        self.encoder_layers = nn.ModuleList([
+            MATEncoderLayer(
+                dist_kernel='softmax',
+                lambda_attention=0.33,
+                lambda_distance=0.33,
+                h=num_heads,
+                sa_hsize=d_model,
+                sa_dropout_p=rate,
+                output_bias=True,
+                d_input=d_model,
+                d_hidden=dff,
+                d_output=d_model,
+                activation='leakyrelu',
+                n_layers=1,
+                ff_dropout_p=rate,
+                encoder_hsize=d_model,
+                encoder_dropout_p=rate
+            ) for _ in range(num_layers)
+        ])
+        self.dropout = nn.Dropout(rate)
+
+    def forward(self, x, training, mask, adjoin_matrix):
+        adjoin_matrix = adjoin_matrix.unsqueeze(1)
+        x = self.embedding(x)
+        x = self.dropout(x)
+
+        for layer in self.encoder_layers:
+            x = layer(x, mask, adj_matrix=adjoin_matrix, distance_matrix=adjoin_matrix)
+        return x
+
+
+
+class BertModel(nn.Module):
+    def __init__(self, num_layers=6, d_model=256, dff=512, num_heads=8, vocab_size=18, dropout_rate=0.1):
+        super().__init__()
+        self.encoder = Encoder(
+            num_layers=num_layers,
+            d_model=d_model,
+            num_heads=num_heads,
+            dff=dff,
+            input_vocab_size=vocab_size,
+            maximum_position_encoding=200,
+            rate=dropout_rate
+        )
+        self.fc1 = nn.Linear(d_model, d_model)
+        self.layernorm = nn.LayerNorm(d_model)
+        self.fc2 = nn.Linear(d_model, vocab_size)
+
+    def forward(self, x, adjoin_matrix, mask, training=False):
+        x = self.encoder(x, training=training, mask=mask, adjoin_matrix=adjoin_matrix)
+        x = self.fc1(x)
+        x = self.layernorm(x)
+        x = self.fc2(x)
+        return x
+
+#Added Scaled Dot Product Attention to MHMATA and replaced single_attention with SDPA
+class MultiHeadedMATAttention(nn.Module):
+    """First constructs an attention layer tailored to the Molecular Attention Transformer [1]_ and then converts it into Multi-Headed Attention.
+
+    In Multi-Headed attention the attention mechanism multiple times parallely through the multiple attention heads.
+    Thus, different subsequences of a given sequences can be processed differently.
+    The query, key and value parameters are split multiple ways and each split is passed separately through a different attention head.
+    References
+    ----------
+    .. [1] Lukasz Maziarka et al. "Molecule Attention Transformer" Graph Representation Learning workshop and Machine Learning and the Physical Sciences workshop at NeurIPS 2019. 2020. https://arxiv.org/abs/2002.08264
+    Examples
+    --------
+    >>> from deepchem.models.torch_models.layers import MultiHeadedMATAttention, MATEmbedding
+    >>> import deepchem as dc
+    >>> import torch
+    >>> input_smile = "CC"
+    >>> feat = dc.feat.MATFeaturizer()
+    >>> input_smile = "CC"
+    >>> out = feat.featurize(input_smile)
+    >>> node = torch.tensor(out[0].node_features).float().unsqueeze(0)
+    >>> adj = torch.tensor(out[0].adjacency_matrix).float().unsqueeze(0)
+    >>> dist = torch.tensor(out[0].distance_matrix).float().unsqueeze(0)
+    >>> mask = torch.sum(torch.abs(node), dim=-1) != 0
+    >>> layer = MultiHeadedMATAttention(
+    ...    dist_kernel='softmax',
+    ...    lambda_attention=0.33,
+    ...    lambda_distance=0.33,
+    ...    h=16,
+    ...    hsize=1024,
+    ...    dropout_p=0.0)
+    >>> op = MATEmbedding()(node)
+    >>> output = layer(op, op, op, mask, adj, dist)
+    """
+
+    def __init__(self,
+                 dist_kernel: str = 'softmax',
+                 lambda_attention: float = 0.33,
+                 lambda_distance: float = 0.33,
+                 h: int = 16,
+                 hsize: int = 1024,
+                 dropout_p: float = 0.0,
+                 output_bias: bool = True):
+        """Initialize a multi-headed attention layer.
+        Parameters
+        ----------
+        dist_kernel: str
+            Kernel activation to be used. Can be either 'softmax' for softmax or 'exp' for exponential.
+        lambda_attention: float
+            Constant to be multiplied with the attention matrix.
+        lambda_distance: float
+            Constant to be multiplied with the distance matrix.
+        h: int
+            Number of attention heads.
+        hsize: int
+            Size of dense layer.
+        dropout_p: float
+            Dropout probability.
+        output_bias: bool
+            If True, dense layers will use bias vectors.
+        """
+        super().__init__()
+        if dist_kernel == "softmax":
+            self.dist_kernel = lambda x: torch.softmax(-x, dim=-1)
+        elif dist_kernel == "exp":
+            self.dist_kernel = lambda x: torch.exp(-x)
+        self.lambda_attention = lambda_attention
+        self.lambda_distance = lambda_distance
+        self.lambda_adjacency = 1.0 - self.lambda_attention - self.lambda_distance
+        self.d_k = hsize // h
+        self.h = h
+        linear_layer = nn.Linear(hsize, hsize)
+        self.linear_layers = nn.ModuleList([linear_layer for _ in range(3)])
+        self.dropout_p = nn.Dropout(dropout_p)
+        self.output_linear = nn.Linear(hsize, hsize, output_bias)
+
+    def _single_attention(
+            self,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            mask: torch.Tensor,
+            adj_matrix: torch.Tensor,
+            distance_matrix: torch.Tensor,
+            dropout_p: float = 0.0,
+            eps: float = 1e-6,
+            inf: float = 1e12) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Defining and computing output for a single MAT attention layer.
+        Parameters
+        ----------
+        query: torch.Tensor
+            Standard query parameter for attention.
+        key: torch.Tensor
+            Standard key parameter for attention.
+        value: torch.Tensor
+            Standard value parameter for attention.
+        mask: torch.Tensor
+            Masks out padding values so that they are not taken into account when computing the attention score.
+        adj_matrix: torch.Tensor
+            Adjacency matrix of the input molecule, returned from dc.feat.MATFeaturizer()
+        dist_matrix: torch.Tensor
+            Distance matrix of the input molecule, returned from dc.feat.MATFeaturizer()
+        dropout_p: float
+            Dropout probability.
+        eps: float
+            Epsilon value
+        inf: float
+            Value of infinity to be used.
+        """
+        d_k = query.size(-1)
+
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
+
+        if mask is not None:
+            scores = scores.masked_fill(
+                mask.unsqueeze(1).repeat(1, query.shape[1], query.shape[2],
+                                         1) == 0, -inf)
+        p_attn = F.softmax(scores, dim=-1)
+
+        adj_matrix = adj_matrix / (
+            torch.sum(torch.tensor(adj_matrix), dim=-1).unsqueeze(2) + eps)
+
+        if len(adj_matrix.shape) <= 3:
+            p_adj = adj_matrix.unsqueeze(1).repeat(1, query.shape[1], 1, 1)
+        else:
+            p_adj = adj_matrix.repeat(1, query.shape[1], 1, 1)
+
+        distance_matrix = torch.tensor(distance_matrix).squeeze().masked_fill(
+            mask.repeat(1, mask.shape[-1], 1) == 0, np.inf)
+
+        distance_matrix = self.dist_kernel(distance_matrix)
+
+        p_dist = distance_matrix.unsqueeze(1).repeat(1, query.shape[1], 1, 1)
+
+        p_weighted = self.lambda_attention * p_attn + self.lambda_distance * p_dist + self.lambda_adjacency * p_adj
+        p_weighted = self.dropout_p(p_weighted)
+
+        return torch.matmul(p_weighted.float(), value.float()), p_attn
+
+    def forward(self,
+                query: torch.Tensor,
+                key: torch.Tensor,
+                value: torch.Tensor,
+                mask: torch.Tensor,
+                adj_matrix: torch.Tensor,
+                distance_matrix: torch.Tensor,
+                dropout_p: float = 0.0,
+                eps: float = 1e-6,
+                inf: float = 1e12) -> torch.Tensor:
+        """Output computation for the MultiHeadedAttention layer.
+        Parameters
+        ----------
+        query: torch.Tensor
+            Standard query parameter for attention.
+        key: torch.Tensor
+            Standard key parameter for attention.
+        value: torch.Tensor
+            Standard value parameter for attention.
+        mask: torch.Tensor
+            Masks out padding values so that they are not taken into account when computing the attention score.
+        adj_matrix: torch.Tensor
+            Adjacency matrix of the input molecule, returned from dc.feat.MATFeaturizer()
+        dist_matrix: torch.Tensor
+            Distance matrix of the input molecule, returned from dc.feat.MATFeaturizer()
+        dropout_p: float
+            Dropout probability.
+        eps: float
+            Epsilon value
+        inf: float
+            Value of infinity to be used.
+        """
+        if mask is not None and len(mask.shape) <= 2:
+            mask = mask.unsqueeze(1)
+
+        batch_size = query.size(0)
+        query, key, value = [
+            layer(x).view(batch_size, -1, self.h, self.d_k).transpose(1, 2)
+            for layer, x in zip(self.linear_layers, (query, key, value))
+        ]
+
+        x, _ = self.scaled_dot_product_attention(query, key, value, mask, adj_matrix)
+        x = x.transpose(1, 2).contiguous().view(batch_size, -1,
+                                                self.h * self.d_k)
+
+        return self.output_linear(x)
+    def scaled_dot_product_attention(q,k,v,mask,adjoin_matrix):
+        k = k.permute(0, 1, 3, 2)
+        matmul_qk = torch.matmul(q,k)
+        
+        dk = k.shape[-1]
+        scaled_attention_logits = matmul_qk / torch.math.sqrt(dk)
+        if mask is not None:
+            scaled_attention_logits += (mask * -1e9)
+        if adjoin_matrix is not None:
+            scaled_attention_logits += adjoin_matrix
+        
+        attention_weights = torch.softmax(scaled_attention_logits,dim = -1)
+        output = torch.matmul(attention_weights,v)
+        return output, attention_weights
+
+
+
 class MultilayerPerceptron(nn.Module):
     """A simple fully connected feed-forward network, otherwise known as a multilayer perceptron (MLP).
 
@@ -431,190 +698,7 @@ class ScaleNorm(nn.Module):
         return x * norm
 
 
-class MultiHeadedMATAttention(nn.Module):
-    """First constructs an attention layer tailored to the Molecular Attention Transformer [1]_ and then converts it into Multi-Headed Attention.
 
-    In Multi-Headed attention the attention mechanism multiple times parallely through the multiple attention heads.
-    Thus, different subsequences of a given sequences can be processed differently.
-    The query, key and value parameters are split multiple ways and each split is passed separately through a different attention head.
-    References
-    ----------
-    .. [1] Lukasz Maziarka et al. "Molecule Attention Transformer" Graph Representation Learning workshop and Machine Learning and the Physical Sciences workshop at NeurIPS 2019. 2020. https://arxiv.org/abs/2002.08264
-    Examples
-    --------
-    >>> from deepchem.models.torch_models.layers import MultiHeadedMATAttention, MATEmbedding
-    >>> import deepchem as dc
-    >>> import torch
-    >>> input_smile = "CC"
-    >>> feat = dc.feat.MATFeaturizer()
-    >>> input_smile = "CC"
-    >>> out = feat.featurize(input_smile)
-    >>> node = torch.tensor(out[0].node_features).float().unsqueeze(0)
-    >>> adj = torch.tensor(out[0].adjacency_matrix).float().unsqueeze(0)
-    >>> dist = torch.tensor(out[0].distance_matrix).float().unsqueeze(0)
-    >>> mask = torch.sum(torch.abs(node), dim=-1) != 0
-    >>> layer = MultiHeadedMATAttention(
-    ...    dist_kernel='softmax',
-    ...    lambda_attention=0.33,
-    ...    lambda_distance=0.33,
-    ...    h=16,
-    ...    hsize=1024,
-    ...    dropout_p=0.0)
-    >>> op = MATEmbedding()(node)
-    >>> output = layer(op, op, op, mask, adj, dist)
-    """
-
-    def __init__(self,
-                 dist_kernel: str = 'softmax',
-                 lambda_attention: float = 0.33,
-                 lambda_distance: float = 0.33,
-                 h: int = 16,
-                 hsize: int = 1024,
-                 dropout_p: float = 0.0,
-                 output_bias: bool = True):
-        """Initialize a multi-headed attention layer.
-        Parameters
-        ----------
-        dist_kernel: str
-            Kernel activation to be used. Can be either 'softmax' for softmax or 'exp' for exponential.
-        lambda_attention: float
-            Constant to be multiplied with the attention matrix.
-        lambda_distance: float
-            Constant to be multiplied with the distance matrix.
-        h: int
-            Number of attention heads.
-        hsize: int
-            Size of dense layer.
-        dropout_p: float
-            Dropout probability.
-        output_bias: bool
-            If True, dense layers will use bias vectors.
-        """
-        super().__init__()
-        if dist_kernel == "softmax":
-            self.dist_kernel = lambda x: torch.softmax(-x, dim=-1)
-        elif dist_kernel == "exp":
-            self.dist_kernel = lambda x: torch.exp(-x)
-        self.lambda_attention = lambda_attention
-        self.lambda_distance = lambda_distance
-        self.lambda_adjacency = 1.0 - self.lambda_attention - self.lambda_distance
-        self.d_k = hsize // h
-        self.h = h
-        linear_layer = nn.Linear(hsize, hsize)
-        self.linear_layers = nn.ModuleList([linear_layer for _ in range(3)])
-        self.dropout_p = nn.Dropout(dropout_p)
-        self.output_linear = nn.Linear(hsize, hsize, output_bias)
-
-    def _single_attention(
-            self,
-            query: torch.Tensor,
-            key: torch.Tensor,
-            value: torch.Tensor,
-            mask: torch.Tensor,
-            adj_matrix: torch.Tensor,
-            distance_matrix: torch.Tensor,
-            dropout_p: float = 0.0,
-            eps: float = 1e-6,
-            inf: float = 1e12) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Defining and computing output for a single MAT attention layer.
-        Parameters
-        ----------
-        query: torch.Tensor
-            Standard query parameter for attention.
-        key: torch.Tensor
-            Standard key parameter for attention.
-        value: torch.Tensor
-            Standard value parameter for attention.
-        mask: torch.Tensor
-            Masks out padding values so that they are not taken into account when computing the attention score.
-        adj_matrix: torch.Tensor
-            Adjacency matrix of the input molecule, returned from dc.feat.MATFeaturizer()
-        dist_matrix: torch.Tensor
-            Distance matrix of the input molecule, returned from dc.feat.MATFeaturizer()
-        dropout_p: float
-            Dropout probability.
-        eps: float
-            Epsilon value
-        inf: float
-            Value of infinity to be used.
-        """
-        d_k = query.size(-1)
-
-        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
-
-        if mask is not None:
-            scores = scores.masked_fill(
-                mask.unsqueeze(1).repeat(1, query.shape[1], query.shape[2],
-                                         1) == 0, -inf)
-        p_attn = F.softmax(scores, dim=-1)
-
-        adj_matrix = adj_matrix / (
-            torch.sum(torch.tensor(adj_matrix), dim=-1).unsqueeze(2) + eps)
-
-        if len(adj_matrix.shape) <= 3:
-            p_adj = adj_matrix.unsqueeze(1).repeat(1, query.shape[1], 1, 1)
-        else:
-            p_adj = adj_matrix.repeat(1, query.shape[1], 1, 1)
-
-        distance_matrix = torch.tensor(distance_matrix).squeeze().masked_fill(
-            mask.repeat(1, mask.shape[-1], 1) == 0, np.inf)
-
-        distance_matrix = self.dist_kernel(distance_matrix)
-
-        p_dist = distance_matrix.unsqueeze(1).repeat(1, query.shape[1], 1, 1)
-
-        p_weighted = self.lambda_attention * p_attn + self.lambda_distance * p_dist + self.lambda_adjacency * p_adj
-        p_weighted = self.dropout_p(p_weighted)
-
-        return torch.matmul(p_weighted.float(), value.float()), p_attn
-
-    def forward(self,
-                query: torch.Tensor,
-                key: torch.Tensor,
-                value: torch.Tensor,
-                mask: torch.Tensor,
-                adj_matrix: torch.Tensor,
-                distance_matrix: torch.Tensor,
-                dropout_p: float = 0.0,
-                eps: float = 1e-6,
-                inf: float = 1e12) -> torch.Tensor:
-        """Output computation for the MultiHeadedAttention layer.
-        Parameters
-        ----------
-        query: torch.Tensor
-            Standard query parameter for attention.
-        key: torch.Tensor
-            Standard key parameter for attention.
-        value: torch.Tensor
-            Standard value parameter for attention.
-        mask: torch.Tensor
-            Masks out padding values so that they are not taken into account when computing the attention score.
-        adj_matrix: torch.Tensor
-            Adjacency matrix of the input molecule, returned from dc.feat.MATFeaturizer()
-        dist_matrix: torch.Tensor
-            Distance matrix of the input molecule, returned from dc.feat.MATFeaturizer()
-        dropout_p: float
-            Dropout probability.
-        eps: float
-            Epsilon value
-        inf: float
-            Value of infinity to be used.
-        """
-        if mask is not None and len(mask.shape) <= 2:
-            mask = mask.unsqueeze(1)
-
-        batch_size = query.size(0)
-        query, key, value = [
-            layer(x).view(batch_size, -1, self.h, self.d_k).transpose(1, 2)
-            for layer, x in zip(self.linear_layers, (query, key, value))
-        ]
-
-        x, _ = self._single_attention(query, key, value, mask, adj_matrix,
-                                      distance_matrix, dropout_p, eps, inf)
-        x = x.transpose(1, 2).contiguous().view(batch_size, -1,
-                                                self.h * self.d_k)
-
-        return self.output_linear(x)
 
 
 class MATEncoderLayer(nn.Module):
