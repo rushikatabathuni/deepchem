@@ -27,73 +27,277 @@ from deepchem.utils.pytorch_utils import get_activation, segment_sum, unsorted_s
 from torch.nn import init as initializers
 
 
-#Encoder used for ADCNet Model
+#********************************************************************************************************************************
+#********************************************************START OF NEW LAYERS*****************************************************
+#********************************************************************************************************************************
 class Encoder(nn.Module):
     def __init__(self, num_layers, d_model, num_heads, dff, input_vocab_size, maximum_position_encoding=200, rate=0.1):
+        """
+        Transformer-based Encoder that processes input sequences.
+        
+        Args:
+            num_layers (int): Number of encoder layers.
+            d_model (int): Dimensionality of the embedding & hidden layers.
+            num_heads (int): Number of attention heads.
+            dff (int): Dimensionality of the feedforward layer.
+            input_vocab_size (int): Vocabulary size for the embedding layer.
+            maximum_position_encoding (int, optional): Maximum sequence length for position encoding.
+            rate (float, optional): Dropout rate. Default is 0.1.
+        """
         super().__init__()
         self.d_model = d_model
         self.num_layers = num_layers
 
-        # Use MATEmbedding from layers.py
+        # Step 1: Initialize an embedding layer to convert input tokens into dense vectors
+        # Uses MATEmbedding, a modified embedding layer (from layers.py)
         self.embedding = MATEmbedding(d_input=input_vocab_size, d_output=d_model)
 
-        # Use MATEncoderLayer from layers.py
+        # Step 2: Create a list of Transformer encoder layers
+        # Each layer is an instance of MATEncoderLayer, handling self-attention and feedforward operations
         self.encoder_layers = nn.ModuleList([
             MATEncoderLayer(
-                dist_kernel='softmax',
-                lambda_attention=0.33,
-                lambda_distance=0.33,
-                h=num_heads,
-                sa_hsize=d_model,
-                sa_dropout_p=rate,
-                output_bias=True,
-                d_input=d_model,
-                d_hidden=dff,
-                d_output=d_model,
-                activation='leakyrelu',
-                n_layers=1,
-                ff_dropout_p=rate,
-                encoder_hsize=d_model,
-                encoder_dropout_p=rate
+                dist_kernel='softmax',       # Distance kernel type
+                lambda_attention=0.33,       # Weighting for self-attention
+                lambda_distance=0.33,        # Weighting for distance-aware attention
+                h=num_heads,                 # Number of attention heads
+                sa_hsize=d_model,            # Hidden size for self-attention
+                sa_dropout_p=rate,           # Dropout probability in self-attention
+                output_bias=True,            # Bias term in output layer
+                d_input=d_model,             # Input dimension
+                d_hidden=dff,                # Hidden layer dimension for feedforward
+                d_output=d_model,            # Output dimension (same as input for residual connections)
+                activation='leakyrelu',      # Activation function (LeakyReLU)
+                n_layers=1,                  # Number of layers in feedforward network
+                ff_dropout_p=rate,           # Dropout probability for feedforward network
+                encoder_hsize=d_model,       # Hidden size for encoder layers
+                encoder_dropout_p=rate       # Dropout probability for encoder layers
             ) for _ in range(num_layers)
         ])
+
+        # Step 3: Apply dropout to the embedding layer output
         self.dropout = nn.Dropout(rate)
 
     def forward(self, x, training, mask, adjoin_matrix):
-        adjoin_matrix = adjoin_matrix.unsqueeze(1)
-        x = self.embedding(x)
+        """
+        Forward pass of the encoder.
+
+        Args:
+            x (Tensor): Input tensor of shape (batch_size, sequence_length).
+            training (bool): Whether the model is in training mode.
+            mask (Tensor): Masking tensor to prevent attending to certain positions.
+            adjoin_matrix (Tensor): Adjacency matrix providing relational information.
+
+        Returns:
+            Tensor: Encoded representation of shape (batch_size, sequence_length, d_model).
+        """
+
+        # Step 1: Expand adjacency matrix dimensions to match self-attention requirements
+        adjoin_matrix = adjoin_matrix.unsqueeze(1)  # Shape: (batch_size, 1, seq_len, seq_len)
+
+        # Step 2: Convert input tokens into dense vector representations using MATEmbedding
+        x = self.embedding(x)  # Shape: (batch_size, sequence_length, d_model)
+
+        # Step 3: Apply dropout to embedding output
         x = self.dropout(x)
 
+        # Step 4: Pass through each encoder layer sequentially
         for layer in self.encoder_layers:
+            # Each layer processes the input using self-attention and feedforward networks
             x = layer(x, mask, adj_matrix=adjoin_matrix, distance_matrix=adjoin_matrix)
+
+        # Step 5: Return the encoded output
         return x
 
 
 
 class BertModel(nn.Module):
     def __init__(self, num_layers=6, d_model=256, dff=512, num_heads=8, vocab_size=18, dropout_rate=0.1):
+        """
+        A Functional Group - BERT model with an encoder, feedforward layers, and normalization.
+
+        Args:
+            num_layers (int): Number of layers in the encoder.
+            d_model (int): Hidden dimension of the model.
+            dff (int): Feedforward network dimension.
+            num_heads (int): Number of attention heads.
+            vocab_size (int): Size of the vocabulary.
+            dropout_rate (float, optional): Dropout rate. Default is 0.1.
+        """
         super().__init__()
+
+        # Step 1: Define the Transformer-based encoder
         self.encoder = Encoder(
-            num_layers=num_layers,
-            d_model=d_model,
-            num_heads=num_heads,
-            dff=dff,
-            input_vocab_size=vocab_size,
-            maximum_position_encoding=200,
-            rate=dropout_rate
+            num_layers=num_layers,        # Number of encoder layers
+            d_model=d_model,              # Embedding and hidden layer size
+            num_heads=num_heads,          # Multi-head attention heads
+            dff=dff,                      # Feedforward network size
+            input_vocab_size=vocab_size,  # Input vocabulary size
+            maximum_position_encoding=200,# Maximum position encoding
+            rate=dropout_rate             # Dropout probability
         )
-        self.fc1 = nn.Linear(d_model, d_model)
+
+        # Step 2: Fully connected layer for feature transformation
+        self.fc1 = nn.Linear(d_model, d_model)  # Linear transformation layer
+
+        # Step 3: Layer Normalization to stabilize training
         self.layernorm = nn.LayerNorm(d_model)
+
+        # Step 4: Output layer mapping to vocabulary size
         self.fc2 = nn.Linear(d_model, vocab_size)
 
     def forward(self, x, adjoin_matrix, mask, training=False):
+        """
+        Forward pass of the BERT-like model.
+
+        Args:
+            x (Tensor): Input tensor of shape (batch_size, sequence_length).
+            adjoin_matrix (Tensor): Adjacency matrix for relation-aware attention.
+            mask (Tensor): Mask to prevent attending to certain positions.
+            training (bool, optional): Whether the model is in training mode. Default is False.
+
+        Returns:
+            Tensor: Output tensor of shape (batch_size, sequence_length, vocab_size).
+        """
+
+        # Step 1: Pass input through the Transformer encoder
         x = self.encoder(x, training=training, mask=mask, adjoin_matrix=adjoin_matrix)
+
+        # Step 2: Apply a fully connected layer for feature transformation
         x = self.fc1(x)
+
+        # Step 3: Apply layer normalization for stable training
         x = self.layernorm(x)
+
+        # Step 4: Final output projection to vocabulary space
         x = self.fc2(x)
+
+        # Step 5: Return output logits (not softmax applied)
         return x
 
-#Added Scaled Dot Product Attention to MHMATA and replaced single_attention with SDPA
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, num_heads):
+        """
+        Multi-Head Self-Attention mechanism.
+
+        Args:
+            d_model (int): Total feature dimension (should be divisible by num_heads).
+            num_heads (int): Number of attention heads.
+        """
+        super().__init__()
+        self.num_heads = num_heads
+        self.d_model = d_model
+        self.depth = d_model // num_heads  # Size of each head
+
+        # Linear layers for Query, Key, and Value transformations
+        self.wq = nn.Linear(d_model, d_model)
+        self.wk = nn.Linear(d_model, d_model)
+        self.wv = nn.Linear(d_model, d_model)
+
+        # Final output transformation
+        self.dense = nn.Linear(d_model, d_model)
+
+    def forward(self, v, k, q, mask=None, adjoin_matrix=None):
+        """
+        Forward pass for Multi-Head Attention.
+
+        Args:
+            v (Tensor): Value tensor (batch_size, seq_len, d_model).
+            k (Tensor): Key tensor (batch_size, seq_len, d_model).
+            q (Tensor): Query tensor (batch_size, seq_len, d_model).
+            mask (Tensor, optional): Mask tensor for ignoring certain positions.
+            adjoin_matrix (Tensor, optional): Structural bias matrix.
+
+        Returns:
+            output (Tensor): Attention output (batch_size, seq_len, d_model).
+            attention_weights (Tensor): Attention weight matrix.
+        """
+        batch_size = q.shape[0]
+
+        # Step 1: Apply linear layers to project Q, K, V
+        q = self.wq(q)
+        k = self.wk(k)
+        v = self.wv(v)
+
+        # Step 2: Split into multiple heads
+        q = self.split_heads(q, batch_size)
+        k = self.split_heads(k, batch_size)
+        v = self.split_heads(v, batch_size)
+
+        # Step 3: Apply scaled dot-product attention
+        scaled_attention, attention_weights = self.scaled_dot_product_attention(q, k, v, mask, adjoin_matrix)
+
+        # Step 4: Rearrange attention output
+        scaled_attention = scaled_attention.permute(0, 2, 1, 3)  # Reshape: (batch_size, seq_len, num_heads, depth)
+
+        # Step 5: Concatenate heads and apply final linear layer
+        concat_attention = scaled_attention.reshape(batch_size, -1, self.d_model)  # Reshape back to (batch_size, seq_len, d_model)
+        output = self.dense(concat_attention)  # Final linear layer
+
+        return output, attention_weights
+
+    def split_heads(self, x, batch_size):
+        """
+        Splits the input tensor into multiple heads.
+
+        Args:
+            x (Tensor): Input tensor of shape (batch_size, seq_len, d_model).
+            batch_size (int): Batch size.
+
+        Returns:
+            Tensor: Reshaped tensor of shape (batch_size, num_heads, seq_len, depth).
+        """
+        x = x.view(batch_size, -1, self.num_heads, self.depth)  # Reshape: (batch_size, seq_len, num_heads, depth)
+        return x.permute(0, 2, 1, 3)  # Swap dimensions for attention: (batch_size, num_heads, seq_len, depth)
+
+
+    def scaled_dot_product_attention(q, k, v, mask=None, adjoin_matrix=None):
+        """
+        Computes scaled dot-product attention.
+    
+        Args:
+            q (Tensor): Query tensor of shape (batch_size, num_heads, seq_len, depth).
+            k (Tensor): Key tensor of shape (batch_size, num_heads, seq_len, depth).
+            v (Tensor): Value tensor of shape (batch_size, num_heads, seq_len, depth).
+            mask (Tensor, optional): Mask tensor to prevent attention to certain positions.
+            adjoin_matrix (Tensor, optional): Matrix for adding structural bias.
+    
+        Returns:
+            Tensor: Output after attention computation.
+            Tensor: Attention weights.
+        """
+        k = k.permute(0, 1, 3, 2)  # Transpose key tensor
+    
+        # Compute dot product of Q and K
+        matmul_qk = torch.matmul(q, k)
+    
+        # Scale by square root of key dimension
+        dk = k.shape[-1]
+        scaled_attention_logits = matmul_qk / torch.sqrt(torch.tensor(dk, dtype=torch.float32))
+    
+        # Apply mask (if provided)
+        if mask is not None:
+            scaled_attention_logits += (mask * -1e9)
+    
+        # Apply adjacency matrix (if provided)
+        if adjoin_matrix is not None:
+            scaled_attention_logits += adjoin_matrix
+    
+        # Compute softmax to get attention weights
+        attention_weights = torch.softmax(scaled_attention_logits, dim=-1)
+    
+        # Compute the weighted sum of values
+        output = torch.matmul(attention_weights, v)
+    
+        return output, attention_weights
+
+
+#********************************************************************************************************************************
+#********************************************************END*********************************************************************
+#********************************************************************************************************************************
+
+
+
 class MultiHeadedMATAttention(nn.Module):
     """First constructs an attention layer tailored to the Molecular Attention Transformer [1]_ and then converts it into Multi-Headed Attention.
 
@@ -272,25 +476,11 @@ class MultiHeadedMATAttention(nn.Module):
             for layer, x in zip(self.linear_layers, (query, key, value))
         ]
 
-        x, _ = self.scaled_dot_product_attention(query, key, value, mask, adj_matrix)
+        x, _ = self._single_attention(query, key, value, mask, adj_matrix)
         x = x.transpose(1, 2).contiguous().view(batch_size, -1,
                                                 self.h * self.d_k)
 
         return self.output_linear(x)
-    def scaled_dot_product_attention(q,k,v,mask,adjoin_matrix):
-        k = k.permute(0, 1, 3, 2)
-        matmul_qk = torch.matmul(q,k)
-        
-        dk = k.shape[-1]
-        scaled_attention_logits = matmul_qk / torch.math.sqrt(dk)
-        if mask is not None:
-            scaled_attention_logits += (mask * -1e9)
-        if adjoin_matrix is not None:
-            scaled_attention_logits += adjoin_matrix
-        
-        attention_weights = torch.softmax(scaled_attention_logits,dim = -1)
-        output = torch.matmul(attention_weights,v)
-        return output, attention_weights
 
 
 
