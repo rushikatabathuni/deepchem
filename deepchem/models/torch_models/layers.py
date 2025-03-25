@@ -292,6 +292,35 @@ class MultiHeadAttention(nn.Module):
         return output, attention_weights
 
 
+
+class FeedForwardNetwork(nn.Module):
+    def __init__(self, dff, d_model):
+        """
+        Initializes a FeedForward Network (FFN) layer used in transformers.
+
+        Parameters:
+        dff (int): The hidden layer size, usually larger than d_model.
+        d_model (int): The input and output feature size.
+        """
+        super().__init__()
+        self.fc1 = nn.Linear(d_model, dff)  # Expands feature size from d_model to dff
+        self.fc2 = nn.Linear(dff, d_model)  # Projects back to d_model size
+
+    def forward(self, x):
+        """
+        Forward pass through the FeedForward network.
+
+        Parameters:
+        x (Tensor): Input tensor of shape (batch_size, sequence_length, d_model).
+
+        Returns:
+        Tensor: Transformed tensor of the same shape as input.
+        """
+        x = F.gelu(self.fc1(x))  # Apply GELU activation after the first linear layer
+        x = self.fc2(x)  # Transform back to d_model dimensions
+        return x
+
+
 #********************************************************************************************************************************
 #********************************************************END*********************************************************************
 #********************************************************************************************************************************
